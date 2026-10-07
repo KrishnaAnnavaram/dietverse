@@ -494,7 +494,7 @@ Read these problems before you use dietverse results.
 | 6 | VR client | `BackendClient.cs` is not tested in CI, and the original VR scene is not in this repository | Test the script in your own Unity scene |
 | 7 | Sessions | The backend keeps sessions in memory | Sessions are lost on restart. Use a store for more than one backend process |
 | 8 | Screener | PHQ-2 and GAD-2 are short screeners, not diagnoses | A positive screen needs a professional assessment |
-| 9 | Credentials | The keys of the earlier prototype were in its client code | Revoke and rotate those keys. They are not in this repository |
+| 9 | Credentials | A provider key in a client build is visible to every user of that client | Keep all keys on the backend. If a key was in client code at any time, revoke it and make a new key |
 
 ---
 
