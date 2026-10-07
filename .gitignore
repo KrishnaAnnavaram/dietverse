@@ -1,0 +1,31 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# data, audio and runs are never committed
+/data/*
+!/data/README.md
+/.dietverse/
+/runs/
+/models/
+*.csv
+*.db
+*.mp3
+*.wav
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# unity (only the client script is in this repository)
+Library/
+Temp/
+*.meta
