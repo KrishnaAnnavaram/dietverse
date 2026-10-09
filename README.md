@@ -76,6 +76,7 @@ This README is the **one location that explains all of dietverse**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one VR question](#42-the-life-cycle-of-one-vr-question)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Country data and analysis](#5-country-data-and-analysis)
 6. 🟢 [The diet guide](#6-the-diet-guide)
 7. 🟣 [The assistant, the screener and the backend](#7-the-assistant-the-screener-and-the-backend)
@@ -143,6 +144,58 @@ flowchart LR
 | Synthetic data | `src/dietverse/synthetic.py` | Invented countries in the same file layout |
 | CLI | `src/dietverse/cli.py` | The `dietverse` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>dietverse command"]
+        API["api.py<br/>create_app, extra api"]
+        WEB["web/streamlit_app.py<br/>extra web"]
+        VR["clients/unity/<br/>BackendClient.cs"]
+    end
+    subgraph COUNTRY["Country data"]
+        SYN["synthetic.py<br/>write_synthetic"]
+        DATA["data.py<br/>load_dataset, shares, outcomes"]
+        ANA["analytics.py<br/>associations, cfr_vs_deaths"]
+    end
+    subgraph GUIDE["Diet guide"]
+        PLAN["plan.py<br/>Profile, make_plan"]
+        EN["energy.py<br/>daily_energy"]
+        GL["guidelines.py<br/>PATTERN, FOODS, pattern_level"]
+    end
+    subgraph TALK["Assistant and screener"]
+        AS["assistant.py<br/>Assistant, OfflineBrain, OpenAIBrain"]
+        TTS["tts.py<br/>build_speech"]
+        SCR["screener.py<br/>score"]
+    end
+    CFG["config.py<br/>Settings.from_env"]
+
+    VR -- "HTTP" --> API
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> DATA
+    CLI --> ANA
+    CLI --> PLAN
+    CLI --> SCR
+    CLI --> AS
+    CLI -- "serve" --> API
+    CLI -- "web" --> WEB
+    API --> AS
+    API --> PLAN
+    API --> SCR
+    API --> DATA
+    WEB --> DATA
+    WEB --> ANA
+    WEB --> PLAN
+    WEB --> SCR
+    ANA --> DATA
+    PLAN --> EN
+    PLAN --> GL
+    AS --> TTS
+    AS --> GL
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -178,6 +231,24 @@ dietverse/
 ### 3.1 No credentials in a client
 The VR client sends requests only to the backend. The backend reads the model key and the AWS credentials from its own environment. `DIETVERSE_API_TOKEN` can protect the backend with a per-device token. A test checks that no key pattern is in the client or the package.
 
+```mermaid
+flowchart LR
+    subgraph CLIENT["Client side: no credentials"]
+        VR["Unity BackendClient.cs<br/>backendUrl, optional apiToken"]
+    end
+    subgraph SERVER["Backend side"]
+        AUTH{"DIETVERSE_API_TOKEN set<br/>and the Bearer token wrong?"}
+        BE["dietverse backend<br/>FastAPI"]
+        ENV[/"backend environment:<br/>DIETVERSE_LLM_API_KEY,<br/>AWS credentials"/]
+    end
+    VR -- "HTTP request to /api" --> AUTH
+    AUTH -- "yes" --> R401[/"401"/]
+    AUTH -- "no" --> BE
+    ENV --> BE
+    BE --> LLM["OpenAI-compatible endpoint"]
+    BE --> POLLY["Amazon Polly"]
+```
+
 ### 3.2 Correct units
 A food-group value is a share of the national supply, not a portion. The loader checks the unit column and the two sums of 50 in each row. It then gives supply shares that add up to 100% for each country. No output says "kcal (Recommended)".
 
@@ -206,26 +277,63 @@ The wellbeing check uses PHQ-2 and GAD-2 with the published cut-off of 3. The re
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    F["4 country files"] --> L["load: columns, unit, sums, censored values"]
+flowchart TD
+    F[("data/covid-healthy-diet/<br/>4 country files")] --> L["load: columns, unit, sums, censored values"]
     L --> SH["supply shares (sum 100%)"]
     L --> OC["outcomes: deaths per 100k, CFR"]
     SH --> AN["Spearman + partial Spearman + bootstrap"]
     OC --> AN
-    COV["covariates (optional)"] --> AN
-    P["profile"] --> V["validation (adults only)"] --> EN["energy target"] --> PL["pattern level"]
+    COV[/"covariates (optional)"/] --> AN
+    AN --> AT[/"association table + ecological caveat"/]
+    P[/"profile"/] --> V{"validation (adults only)"}
+    V -- "pregnant or breastfeeding" --> REF[/"status referral"/]
+    V -- "valid" --> EN["energy target"] --> PL["pattern level"]
     PL --> GT["group targets + filtered example foods"]
-    GT --> DG["diet guide + notes + limits"]
+    GT --> DG[/"diet guide + notes + limits"/]
     SH --> CC["country context"] --> DG
-    Q["VR question"] --> BE["backend"] --> RF{"red flag?"}
+    DG --> HUMAN{{"HUMAN<br/>doctor or registered dietitian<br/>reviews the decisions"}}
+    REF --> HUMAN
+    Q[/"VR question"/] --> BE["backend"] --> RF{"red flag?"}
     RF -->|"yes"| URG["urgent-care answer"]
     RF -->|"no"| BR["brain with capped history"]
     BR --> SP["speech: new audio file"]
     URG --> SP
-    SP --> VR["VR client plays the file"]
+    SP --> AUD[("DIETVERSE_AUDIO_DIR")]
+    AUD --> VR[/"VR client plays the file"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one VR question
+
+```mermaid
+stateDiagram-v2
+    state "Session open" as Session
+    state "Message checked" as Checked
+    state "Prompt with capped history" as Prompt
+    state "Audio file written" as Audio
+    state "Turn stored in the session" as Stored
+    state "Clip played" as Played
+    state "HTTP 401, 404 or 422" as Rejected
+    [*] --> Session: POST /api/session
+    Session --> Checked: POST /api/chat
+    Checked --> Rejected: wrong token, unknown session, empty or too long
+    Checked --> urgent: red flag
+    Checked --> Prompt: no red flag
+    Prompt --> answered: brain reply
+    Prompt --> error: AssistantError
+    urgent --> Audio: speak is true
+    answered --> Audio: speak is true
+    urgent --> Stored: speak is false
+    answered --> Stored: speak is false
+    Audio --> Stored
+    Stored --> Played: client gets the audio_url
+    Stored --> [*]: no audio_url
+    Played --> [*]
+    error --> [*]
+    Rejected --> [*]
+```
 
 1. The VR client asks `/api/session` for a session id, one time.
 2. The client sends the question to `/api/chat` with `speak` set to true.
@@ -236,11 +344,86 @@ flowchart TB
 7. The client downloads the file, stops the old clip and plays the new clip.
 8. The backend keeps the question and the answer as one turn of the session.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as VR user
+    participant VR as BackendClient.cs
+    participant BE as Backend api.py
+    participant AS as Assistant
+    participant BR as Brain, offline FAQ or OpenAI-compatible endpoint
+    participant TTS as Speech provider
+    participant FS as Audio folder
+
+    U->>VR: Ask(text)
+    VR->>VR: busy check, one question at a time
+    VR->>BE: POST /api/session, one time
+    BE->>AS: new_session
+    BE-->>VR: session_id
+    VR->>BE: POST /api/chat with speak true
+    BE->>BE: auth, Bearer token check
+    BE->>AS: ask(session_id, message, speak)
+    AS->>AS: length, session and red-flag checks
+    alt red flag
+        AS->>AS: fixed urgent-care answer, no model call
+    else no red flag
+        AS->>BR: reply(system prompt, last turns, question)
+        BR-->>AS: answer text
+    end
+    AS->>TTS: synthesize(text)
+    TTS->>FS: write a new file with a random name
+    AS-->>BE: Reply with text, status and audio
+    BE-->>VR: text, status, audio_url
+    VR->>BE: GET audio_url
+    BE->>FS: read the file
+    BE-->>VR: audio file
+    VR->>U: stop the old clip, play the new clip
+```
+
 ---
 
 ## 5. Country data and analysis
 
 **Purpose.** Show the country data with the correct units and measure country-level associations honestly.
+
+```mermaid
+flowchart TD
+    DIR[/"data_dir"/] --> M["load_dataset: read_measure for<br/>energy, quantity, fat, protein"]
+    M --> EX{"File exists?"}
+    EX -- "no" --> FNF[/"FileNotFoundError"/]
+    EX -- "yes" --> COLS{"All REQUIRED columns,<br/>unit only %, unique countries?"}
+    COLS -- "no" --> DE[/"DataError"/]
+    COLS -- "yes" --> CEN["Undernourished: #lt;2.5 to 2.5,<br/>set undernourished_censored"]
+    CEN --> NUM["to_numeric: groups, aggregates,<br/>population columns"]
+    NUM --> SUM{"validate_shares: 21 groups and<br/>2 aggregates each 50, tolerance 0.5?"}
+    SUM -- "no" --> DE
+    SUM -- "yes" --> REP[/"table + LoadReport"/]
+    REP --> SH["shares: value / group sum × 100"]
+    REP --> OC["outcomes: deaths_per_100k = Deaths × 1000,<br/>cfr_pct = 100 × Deaths / Confirmed"]
+```
+
+The analysis joins the shares, the outcomes and the controls, and then calculates the correlations for each exposure.
+
+```mermaid
+flowchart LR
+    SH[/"shares of one measure"/] --> J["join outcomes,<br/>left join covariates"]
+    OC[/"outcomes"/] --> J
+    COV[/"covariates CSV, optional"/] --> J
+    J --> CT["controls: undernourished_pct<br/>+ covariate columns"]
+    CT --> EXP{"Exposure in the table?"}
+    EXP -- "no" --> KE[/"KeyError"/]
+    EXP -- "yes" --> DROP["dropna on exposure, outcome<br/>and controls, count dropped countries"]
+    DROP --> SP["spearman of the ranks"]
+    DROP --> PS["partial_spearman: rank residuals<br/>after least squares on control ranks"]
+    PS --> BS["bootstrap_ci: n_boot samples,<br/>2.5 and 97.5 percentiles"]
+    SP --> R[/"results + ECOLOGICAL_CAVEAT"/]
+    PS --> R
+    BS --> R
+    OC --> CFR["cfr_vs_deaths: rank of CFR<br/>against deaths per 100k"]
+    CFR --> R
+```
 
 | Input | Output |
 |---|---|
@@ -267,6 +450,32 @@ flowchart TB
 
 **Purpose.** Give one adult general food-group targets that use their own data.
 
+```mermaid
+flowchart TD
+    IN[/"profile: JSON, CLI flags or form"/] --> VAL{"Profile.model_validate:<br/>age 18 to 100, known values,<br/>no extra fields?"}
+    VAL -- "no" --> ERR[/"validation error, HTTP 422"/]
+    VAL -- "yes" --> PREG{"pregnant_or_breastfeeding?"}
+    PREG -- "yes" --> REF[/"status referral, no targets"/]
+    PREG -- "no" --> EN["daily_energy and pattern_level"]
+    EN --> EXC["excluded tags: diet,<br/>allergies, intolerances"]
+    EXC --> GRP["for each group: PATTERN amount<br/>and examples_for"]
+    GRP --> EMPTY{"No example food left,<br/>group not oils?"}
+    EMPTY -- "yes" --> N1["note: ask a dietitian"]
+    EMPTY -- "no" --> KID{"kidney_disease?"}
+    N1 --> KID
+    KID -- "yes" --> P0["protein_foods target = 0"]
+    KID -- "no" --> NOTES["notes: vegan B12, conditions,<br/>lose at BMI below 25, floor, range"]
+    P0 --> NOTES
+    NOTES --> LIM["LIMITS, sodium 1,500 mg<br/>for hypertension"]
+    CTX[/"country context, optional"/] --> OUT
+    LIM --> OUT[/"DietPlan, status plan"/]
+    OUT --> HUMAN{{"HUMAN<br/>doctor or registered dietitian reviews"}}
+    REF --> HUMAN
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
+```
+
 | Input | Output |
 |---|---|
 | `Profile` (pydantic, extra fields are an error) | `DietPlan`: status, BMI, energy, pattern level, group targets with example foods, limits, notes, country context |
@@ -281,6 +490,23 @@ flowchart TB
 6. Select the pattern level nearest to the target (1,600 to 3,200 kcal).
 7. For each food group, give the target and the example foods that the diet, allergies and intolerances allow.
 8. Add notes for each condition, for vegan B12, for an empty group and for a weight-loss goal at a low BMI.
+
+The energy model gives the energy target and the pattern level:
+
+```mermaid
+flowchart LR
+    P[/"sex, weight, height,<br/>age, activity, goal"/] --> BMI["bmi and bmi_category"]
+    P --> MSJ["mifflin_st_jeor:<br/>10 W + 6.25 H − 5 A,<br/>+5 male, −161 female"]
+    MSJ --> ACT["times ACTIVITY_FACTORS<br/>1.2 to 1.9"]
+    ACT --> GOAL["plus GOAL_ADJUSTMENT<br/>lose −500, gain +300"]
+    GOAL --> FLOOR{"Below MIN_KCAL?<br/>1,200 female, 1,500 male"}
+    FLOOR -- "yes" --> SETF["target = floor,<br/>floor_applied"]
+    FLOOR -- "no" --> T["target_kcal"]
+    SETF --> LV["pattern_level: nearest level,<br/>1,600 to 3,200"]
+    T --> LV
+    LV --> OUT[/"energy + pattern level"/]
+    BMI --> OUT
+```
 
 | Pattern level (kcal) | Vegetables (cup-eq) | Fruits (cup-eq) | Grains (oz-eq) | Dairy (cup-eq) | Protein foods (oz-eq) | Oils (g) |
 |---|---|---|---|---|---|---|
@@ -312,6 +538,23 @@ The table follows the Healthy U.S.-Style Dietary Pattern (Dietary Guidelines for
 
 **Purpose.** Give the VR client and other clients one safe backend for questions, the screener and the diet guide.
 
+```mermaid
+flowchart LR
+    REQ[/"HTTP request"/] --> H{"GET /health?"}
+    H -- "yes" --> OK[/"status ok"/]
+    H -- "no" --> AUTH{"Token set and the header<br/>is not Bearer token?<br/>hmac.compare_digest"}
+    AUTH -- "yes" --> E401[/"401"/]
+    AUTH -- "no" --> R{"route"}
+    R -- "POST /api/session" --> S["assistant.new_session"]
+    R -- "POST /api/chat" --> C["assistant.ask"]
+    R -- "GET /api/audio/name" --> A{"Plain name<br/>with one dot?"}
+    A -- "no" --> E400[/"400"/]
+    A -- "yes" --> FR["FileResponse from<br/>audio_dir, or 404"]
+    R -- "POST /api/plan" --> PL["Profile.model_validate, make_plan,<br/>country_profile if known"]
+    R -- "POST /api/screener" --> SC["screener.score"]
+    R -- "GET /api/countries" --> CO["dataset.countries,<br/>or an empty list"]
+```
+
 | Endpoint | Input | Output |
 |---|---|---|
 | `GET /health` | — | `{"status": "ok"}` |
@@ -322,12 +565,67 @@ The table follows the Healthy U.S.-Style Dietary Pattern (Dietary Guidelines for
 | `POST /api/screener` | `phq2` and `gad2` answers (two values from 0 to 3 each) | totals, positive flags, message, resources |
 | `GET /api/countries` | — | the country names |
 
+**Procedure (assistant).** `Assistant.ask` handles one chat message:
+
+```mermaid
+flowchart TD
+    IN[/"session_id, message, speak"/] --> NORM["collapse white space, strip"]
+    NORM --> LEN{"Empty, or more than<br/>800 characters?"}
+    LEN -- "yes" --> VE[/"ValueError, HTTP 422"/]
+    LEN -- "no" --> SES{"Known session?"}
+    SES -- "no" --> KE[/"KeyError, HTTP 404"/]
+    SES -- "yes" --> RF{"RED_FLAGS match?"}
+    RF -- "yes" --> URG["URGENT text,<br/>status urgent"]
+    RF -- "no" --> WIN["SYSTEM_PROMPT + last<br/>max_history_turns turns + question"]
+    WIN --> BR{"brain"}
+    BR -- "offline" --> FAQ["OfflineBrain: first FAQ<br/>keyword match, else FALLBACK"]
+    BR -- "openai" --> OAI["OpenAIBrain: POST /chat/completions,<br/>temperature 0.2, max_tokens 300"]
+    OAI -- "AssistantError" --> ERR[/"status error,<br/>turn not stored"/]
+    FAQ --> ANS["status answered"]
+    OAI --> ANS
+    URG --> SPK{"speak?"}
+    ANS --> SPK
+    SPK -- "yes" --> TTS["speech.synthesize:<br/>new audio file"]
+    SPK -- "no" --> ST["store the user turn<br/>and the assistant turn"]
+    TTS --> ST
+    ST --> OUT[/"Reply: text, status, audio"/]
+```
+
+**Procedure (speech).** `build_speech` selects the speech provider. Each answer gets a new file:
+
+```mermaid
+flowchart LR
+    T[/"answer text"/] --> P{"DIETVERSE_TTS_PROVIDER"}
+    P -- "none" --> NS["NoSpeech: no file,<br/>audio_url null"]
+    P -- "offline" --> OT["OfflineTone: 440 Hz WAV,<br/>length grows with the text"]
+    P -- "polly" --> PS["PollySpeech: neural voice,<br/>first 2,900 characters, MP3"]
+    OT --> F["uuid4 file name<br/>in DIETVERSE_AUDIO_DIR"]
+    PS --> F
+    F --> OUT[/"file name for GET /api/audio/name"/]
+```
+
 **Procedure (screener)**
 
 1. Check that each list has two answers from 0 to 3.
 2. Add the answers of each questionnaire.
 3. A total of 3 or more is a positive screen.
 4. Return the totals, the message and the help resources.
+
+```mermaid
+flowchart LR
+    IN[/"phq2: 2 answers<br/>gad2: 2 answers"/] --> CHK{"Two answers each,<br/>each 0, 1, 2 or 3?"}
+    CHK -- "no" --> ERR[/"error, HTTP 422"/]
+    CHK -- "yes" --> SUM["total of each questionnaire"]
+    SUM --> POS{"A total of 3 or more?"}
+    POS -- "yes" --> PM["positive screen message:<br/>a screen is not a diagnosis"]
+    POS -- "no" --> NM["below the cut-off message"]
+    PM --> OUT[/"totals, positive flags,<br/>message, RESOURCES"/]
+    NM --> OUT
+    OUT --> HUMAN{{"HUMAN<br/>doctor or mental health professional"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
+```
 
 **Rules**
 
@@ -420,6 +718,26 @@ dietverse web
 
 In Unity, add `clients/unity/BackendClient.cs` to a GameObject with an `AudioSource`. Set `backendUrl` and call `Ask(text)` from your UI. Do not put a provider key in the Unity project.
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["dietverse synth"]
+    DL[/"COVID-19 Healthy Diet files,<br/>see data/README.md"/] --> DD[("data/covid-healthy-diet/")]
+    SYN --> SD[("data/synthetic/")]
+    DD --> EXP["dietverse explore"]
+    DD --> ANA["dietverse analyze"]
+    SD -- "--data-dir" --> EXP
+    INS --> PLAN["dietverse plan"]
+    INS --> SCR["dietverse screener"]
+    INS --> CHAT["dietverse chat"]
+    INS --> EXTRA["pip install -e .[api,web]"]
+    EXTRA --> SRV["dietverse serve"]
+    EXTRA --> WEB["dietverse web"]
+    SRV --> VR["Unity BackendClient.cs"]
+    INS --> DEMO["dietverse demo<br/>writes .dietverse/demo"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -438,7 +756,20 @@ In Unity, add `clients/unity/BackendClient.cs` to a GameObject with an `AudioSou
 | `DIETVERSE_API_TOKEN` | Backend | Optional bearer token for `/api` |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | Speech (Polly) | Read by boto3 on the backend. An IAM role is better |
 
-Credentials are only in a local `.env` file on the backend. Git ignores this file. Do not print or commit credentials.
+Credentials are only in the environment of the backend. dietverse does not read a `.env` file itself: load your local `.env` file into the backend environment before you start `dietverse serve`. Git ignores `.env`. Do not print or commit credentials.
+
+```mermaid
+flowchart LR
+    ENV[/"process environment<br/>DIETVERSE_ variables"/] --> FE["Settings.from_env"]
+    FE --> LLM{"LLM_PROVIDER is<br/>offline or openai?"}
+    LLM -- "no" --> ERR[/"ConfigError: the CLI prints<br/>error: and returns 2"/]
+    LLM -- "yes" --> TTS{"TTS_PROVIDER is<br/>none, offline or polly?"}
+    TTS -- "no" --> ERR
+    TTS -- "yes" --> INT{"LLM_TIMEOUT_S 1 to 600,<br/>MAX_HISTORY_TURNS 0 to 50?"}
+    INT -- "no" --> ERR
+    INT -- "yes" --> SET[/"Settings"/]
+    SET --> BA["build_assistant:<br/>brain and speech provider"]
+```
 
 ---
 
